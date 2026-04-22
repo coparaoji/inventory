@@ -145,7 +145,6 @@ class MainWindow(QMainWindow):
         self.preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.preview_label.setWordWrap(True)
         self.preview_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        self._set_preview_idle()
 
         self.preview_name = QLabel("")
         self.preview_name.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -155,6 +154,7 @@ class MainWindow(QMainWindow):
         p_layout.addWidget(self.preview_label, stretch=1)
         p_layout.addWidget(self.preview_name)
         h_split.addWidget(preview_panel)
+        self._set_preview_idle()
 
         h_split.setSizes([660, 220])
         b_layout.addWidget(h_split, stretch=1)
