@@ -1,11 +1,6 @@
-import io
-import os
-from pathlib import Path
+from __future__ import annotations
 
-from PIL import Image as PilImage
-from docx import Document
-from docx.shared import Inches, Pt
-from docx.enum.text import WD_ALIGN_PARAGRAPH
+from pathlib import Path
 
 from PyQt6.QtWidgets import (
     QMainWindow,
@@ -20,39 +15,71 @@ from PyQt6.QtWidgets import (
     QStatusBar,
     QHeaderView,
     QFileDialog,
-    QListWidget,
-    QListWidgetItem,
-    QFrame,
     QMessageBox,
     QAbstractItemView,
     QSplitter,
+    QComboBox,
+    QSpinBox,
+    QSizePolicy,
 )
 from PyQt6.QtCore import Qt
-from PyQt6.QtGui import QColor
+from PyQt6.QtGui import QPixmap, QResizeEvent
+
+from app.docx_export import build_docx, QueueEntry, PRODUCT_TYPES
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".tiff", ".tif"}
 
-GRID_COLUMNS = 3
-# Max image size (pixels) inside each docx cell before inserting
-THUMB_PX = 200
-# Column width in inches for the docx table
-COL_WIDTH_IN = 2.2
 
+# ---------------------------------------------------------------------------
+# Custom preview label (rescales pixmap on resize)
+# ---------------------------------------------------------------------------
+
+class _PreviewLabel(QLabel):
+    """QLabel that keeps its pixmap scaled to fill the available area."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._source: QPixmap | None = None
+
+    def set_source(self, pixmap: QPixmap | None) -> None:
+        self._source = pixmap
+        if pixmap:
+            self._rescale()
+        else:
+            super().setPixmap(QPixmap())
+
+    def resizeEvent(self, event: QResizeEvent) -> None:
+        super().resizeEvent(event)
+        if self._source:
+            self._rescale()
+
+    def _rescale(self) -> None:
+        if self._source and not self._source.isNull():
+            scaled = self._source.scaled(
+                self.size(),
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+            super().setPixmap(scaled)
+
+
+# ---------------------------------------------------------------------------
+# Main window
+# ---------------------------------------------------------------------------
 
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Inventory")
-        self.setMinimumSize(980, 680)
+        self.setMinimumSize(1080, 720)
         self._current_folder: Path | None = None
-        self._queue: list[Path] = []
         self._build_ui()
 
     # ------------------------------------------------------------------
     # UI construction
     # ------------------------------------------------------------------
 
-    def _build_ui(self):
+    def _build_ui(self) -> None:
         central = QWidget()
         self.setCentralWidget(central)
 
@@ -60,16 +87,16 @@ class MainWindow(QMainWindow):
         root.setContentsMargins(12, 12, 12, 12)
         root.setSpacing(8)
 
-        splitter = QSplitter(Qt.Orientation.Vertical)
-        root.addWidget(splitter, stretch=1)
+        main_split = QSplitter(Qt.Orientation.Vertical)
+        root.addWidget(main_split, stretch=1)
 
-        # ---- top half: browser ----
-        browser_widget = QWidget()
-        browser_layout = QVBoxLayout(browser_widget)
-        browser_layout.setContentsMargins(0, 0, 0, 0)
-        browser_layout.setSpacing(6)
+        # ── top half: folder browser ──────────────────────────────────────
+        browser = QWidget()
+        b_layout = QVBoxLayout(browser)
+        b_layout.setContentsMargins(0, 0, 0, 0)
+        b_layout.setSpacing(6)
 
-        # folder row
+        # Folder row
         folder_row = QHBoxLayout()
         self.folder_label = QLabel("No folder selected")
         self.folder_label.setStyleSheet("color: grey;")
@@ -77,23 +104,24 @@ class MainWindow(QMainWindow):
         folder_btn.clicked.connect(self._on_select_folder)
         folder_row.addWidget(folder_btn)
         folder_row.addWidget(self.folder_label, stretch=1)
-        browser_layout.addLayout(folder_row)
+        b_layout.addLayout(folder_row)
 
-        # search row
+        # Search + add row
         search_row = QHBoxLayout()
         self.search_input = QLineEdit()
         self.search_input.setPlaceholderText("Filter by filename…")
         self.search_input.textChanged.connect(self._on_search)
+        add_btn = QPushButton("Add Selected to Queue →")
+        add_btn.setToolTip("Add highlighted rows to the print queue (multi-select with Ctrl / Shift)")
+        add_btn.clicked.connect(self._on_add_to_queue)
         search_row.addWidget(QLabel("Search:"))
         search_row.addWidget(self.search_input, stretch=1)
-
-        add_btn = QPushButton("Add Selected to Queue →")
-        add_btn.setToolTip("Add highlighted images to the print queue")
-        add_btn.clicked.connect(self._on_add_to_queue)
         search_row.addWidget(add_btn)
-        browser_layout.addLayout(search_row)
+        b_layout.addLayout(search_row)
 
-        # file table
+        # Horizontal split: file table | image preview
+        h_split = QSplitter(Qt.Orientation.Horizontal)
+
         self.table = QTableWidget(0, 3)
         self.table.setHorizontalHeaderLabels(["Filename", "Extension", "Size"])
         self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
@@ -103,64 +131,107 @@ class MainWindow(QMainWindow):
         self.table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.table.setSortingEnabled(True)
-        browser_layout.addWidget(self.table, stretch=1)
+        self.table.selectionModel().selectionChanged.connect(self._on_table_selection_changed)
+        h_split.addWidget(self.table)
 
-        splitter.addWidget(browser_widget)
+        # Preview panel
+        preview_panel = QWidget()
+        preview_panel.setMinimumWidth(180)
+        p_layout = QVBoxLayout(preview_panel)
+        p_layout.setContentsMargins(6, 0, 0, 0)
+        p_layout.setSpacing(4)
 
-        # ---- bottom half: print queue ----
-        queue_widget = QWidget()
-        queue_layout = QVBoxLayout(queue_widget)
-        queue_layout.setContentsMargins(0, 4, 0, 0)
-        queue_layout.setSpacing(6)
+        self.preview_label = _PreviewLabel()
+        self.preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.preview_label.setWordWrap(True)
+        self.preview_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self._set_preview_idle()
 
-        # divider label + controls
-        queue_header = QHBoxLayout()
-        queue_title = QLabel("Print Queue")
-        queue_title.setStyleSheet("font-weight: bold; font-size: 13px;")
+        self.preview_name = QLabel("")
+        self.preview_name.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.preview_name.setWordWrap(True)
+        self.preview_name.setStyleSheet("font-size: 11px; color: #bbb;")
+
+        p_layout.addWidget(self.preview_label, stretch=1)
+        p_layout.addWidget(self.preview_name)
+        h_split.addWidget(preview_panel)
+
+        h_split.setSizes([660, 220])
+        b_layout.addWidget(h_split, stretch=1)
+        main_split.addWidget(browser)
+
+        # ── bottom half: print queue ──────────────────────────────────────
+        queue_panel = QWidget()
+        q_layout = QVBoxLayout(queue_panel)
+        q_layout.setContentsMargins(0, 4, 0, 0)
+        q_layout.setSpacing(6)
+
+        # Queue header
+        q_header = QHBoxLayout()
+        q_title = QLabel("Print Queue")
+        q_title.setStyleSheet("font-weight: bold; font-size: 13px;")
         self.queue_count_label = QLabel("0 image(s)")
         self.queue_count_label.setStyleSheet("color: grey;")
 
-        clear_btn = QPushButton("Clear Queue")
-        clear_btn.clicked.connect(self._on_clear_queue)
-
         remove_btn = QPushButton("Remove Selected")
         remove_btn.clicked.connect(self._on_remove_from_queue)
+        clear_btn = QPushButton("Clear Queue")
+        clear_btn.clicked.connect(self._on_clear_queue)
 
         self.print_btn = QPushButton("Print to DOCX…")
         self.print_btn.setEnabled(False)
         self.print_btn.setStyleSheet(
-            "QPushButton { background-color: #2d7d46; color: white; font-weight: bold; padding: 4px 12px; }"
-            "QPushButton:disabled { background-color: #555; color: #999; }"
+            "QPushButton         { background-color: #2d7d46; color: white;"
+            "                      font-weight: bold; padding: 4px 14px; }"
+            "QPushButton:disabled{ background-color: #555; color: #888; }"
         )
         self.print_btn.clicked.connect(self._on_print_docx)
 
-        queue_header.addWidget(queue_title)
-        queue_header.addWidget(self.queue_count_label)
-        queue_header.addStretch()
-        queue_header.addWidget(remove_btn)
-        queue_header.addWidget(clear_btn)
-        queue_header.addWidget(self.print_btn)
-        queue_layout.addLayout(queue_header)
+        q_header.addWidget(q_title)
+        q_header.addWidget(self.queue_count_label)
+        q_header.addStretch()
+        q_header.addWidget(remove_btn)
+        q_header.addWidget(clear_btn)
+        q_header.addWidget(self.print_btn)
+        q_layout.addLayout(q_header)
 
-        self.queue_list = QListWidget()
-        self.queue_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
-        self.queue_list.setMaximumHeight(160)
-        queue_layout.addWidget(self.queue_list)
+        # Queue table  (Filename | Product Type | Qty | hidden-path)
+        self.queue_table = QTableWidget(0, 4)
+        self.queue_table.setHorizontalHeaderLabels(
+            ["Filename", "Product Type", "Qty", "_path"]
+        )
+        self.queue_table.horizontalHeader().setSectionResizeMode(
+            0, QHeaderView.ResizeMode.Stretch
+        )
+        self.queue_table.horizontalHeader().setSectionResizeMode(
+            1, QHeaderView.ResizeMode.ResizeToContents
+        )
+        self.queue_table.horizontalHeader().setSectionResizeMode(
+            2, QHeaderView.ResizeMode.ResizeToContents
+        )
+        self.queue_table.setColumnHidden(3, True)
+        self.queue_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.queue_table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.queue_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.queue_table.setMaximumHeight(200)
+        q_layout.addWidget(self.queue_table)
 
-        splitter.addWidget(queue_widget)
-        splitter.setSizes([420, 200])
+        main_split.addWidget(queue_panel)
+        main_split.setSizes([470, 260])
 
-        # status bar
+        # Status bar
         self.status = QStatusBar()
         self.setStatusBar(self.status)
         self._refresh_status()
 
     # ------------------------------------------------------------------
-    # Slots
+    # Slots — folder browser
     # ------------------------------------------------------------------
 
-    def _on_select_folder(self):
-        folder = QFileDialog.getExistingDirectory(self, "Select a folder", str(Path.home()))
+    def _on_select_folder(self) -> None:
+        folder = QFileDialog.getExistingDirectory(
+            self, "Select a folder", str(Path.home())
+        )
         if not folder:
             return
         self._current_folder = Path(folder)
@@ -168,9 +239,10 @@ class MainWindow(QMainWindow):
         self.folder_label.setStyleSheet("")
         self._scan_folder()
 
-    def _scan_folder(self):
+    def _scan_folder(self) -> None:
         self.table.setSortingEnabled(False)
         self.table.setRowCount(0)
+        self._set_preview_idle()
 
         if not self._current_folder:
             return
@@ -201,56 +273,115 @@ class MainWindow(QMainWindow):
         self.table.setSortingEnabled(True)
         self._refresh_status()
 
-    def _on_search(self, text: str):
+    def _on_search(self, text: str) -> None:
         text = text.lower()
         for row in range(self.table.rowCount()):
             item = self.table.item(row, 0)
-            visible = text in (item.text().lower() if item else "")
-            self.table.setRowHidden(row, not visible if text else False)
+            match = text in (item.text().lower() if item else "")
+            self.table.setRowHidden(row, not match if text else False)
 
-    def _on_add_to_queue(self):
-        selected_rows = self.table.selectionModel().selectedRows()
-        if not selected_rows:
-            self.status.showMessage("No images selected — click rows to select them first.", 3000)
+    def _on_table_selection_changed(self) -> None:
+        selected = self.table.selectionModel().selectedRows()
+        if len(selected) == 1:
+            item = self.table.item(selected[0].row(), 0)
+            if item:
+                self._show_preview(Path(item.data(Qt.ItemDataRole.UserRole)))
+                return
+        self._set_preview_idle()
+
+    def _show_preview(self, path: Path) -> None:
+        px = QPixmap(str(path))
+        if px.isNull():
+            self._set_preview_idle("Could not load image.")
+            return
+        self.preview_label.setStyleSheet("border: 1px solid #555; border-radius: 4px;")
+        self.preview_label.setText("")
+        self.preview_label.set_source(px)
+        self.preview_name.setText(path.name)
+
+    def _set_preview_idle(self, msg: str = "Select one image to preview") -> None:
+        self.preview_label.set_source(None)
+        self.preview_label.setText(msg)
+        self.preview_label.setStyleSheet(
+            "color: grey; border: 1px solid #444; border-radius: 4px;"
+        )
+        self.preview_name.setText("")
+
+    # ------------------------------------------------------------------
+    # Slots — print queue
+    # ------------------------------------------------------------------
+
+    def _on_add_to_queue(self) -> None:
+        selected = self.table.selectionModel().selectedRows()
+        if not selected:
+            self.status.showMessage(
+                "No images selected — highlight rows first (Ctrl/Shift for multi-select).", 3000
+            )
             return
 
+        existing = self._queue_paths()
         added = 0
-        for index in selected_rows:
-            name_item = self.table.item(index.row(), 0)
-            if not name_item:
+
+        for index in selected:
+            item = self.table.item(index.row(), 0)
+            if not item:
                 continue
-            path = Path(name_item.data(Qt.ItemDataRole.UserRole))
-            if path not in self._queue:
-                self._queue.append(path)
-                list_item = QListWidgetItem(f"{path.name}  ({path.parent})")
-                list_item.setData(Qt.ItemDataRole.UserRole, str(path))
-                list_item.setToolTip(str(path))
-                self.queue_list.addItem(list_item)
-                added += 1
-
-        self._refresh_queue_ui()
-        self.status.showMessage(f"Added {added} image(s) to queue. Queue total: {len(self._queue)}.", 3000)
-
-    def _on_remove_from_queue(self):
-        selected = self.queue_list.selectedItems()
-        for item in selected:
             path = Path(item.data(Qt.ItemDataRole.UserRole))
-            self._queue = [p for p in self._queue if p != path]
-            self.queue_list.takeItem(self.queue_list.row(item))
+            if path in existing:
+                continue
+
+            row = self.queue_table.rowCount()
+            self.queue_table.insertRow(row)
+
+            # Filename (read-only)
+            fname = QTableWidgetItem(path.name)
+            fname.setToolTip(str(path))
+            self.queue_table.setItem(row, 0, fname)
+
+            # Product type combobox
+            combo = QComboBox()
+            combo.addItems(PRODUCT_TYPES)
+            self.queue_table.setCellWidget(row, 1, combo)
+
+            # Quantity spinbox
+            spin = QSpinBox()
+            spin.setMinimum(1)
+            spin.setMaximum(999)
+            spin.setValue(1)
+            self.queue_table.setCellWidget(row, 2, spin)
+
+            # Hidden full path
+            self.queue_table.setItem(row, 3, QTableWidgetItem(str(path)))
+
+            added += 1
+
+        self._refresh_queue_ui()
+        total = self.queue_table.rowCount()
+        self.status.showMessage(
+            f"Added {added} image(s) to queue.  Queue total: {total}.", 3000
+        )
+
+    def _on_remove_from_queue(self) -> None:
+        rows = sorted(
+            {idx.row() for idx in self.queue_table.selectionModel().selectedRows()},
+            reverse=True,
+        )
+        for row in rows:
+            self.queue_table.removeRow(row)
         self._refresh_queue_ui()
 
-    def _on_clear_queue(self):
-        self._queue.clear()
-        self.queue_list.clear()
+    def _on_clear_queue(self) -> None:
+        self.queue_table.setRowCount(0)
         self._refresh_queue_ui()
 
-    def _on_print_docx(self):
-        if not self._queue:
+    def _on_print_docx(self) -> None:
+        entries = self._collect_entries()
+        if not entries:
             return
 
         save_path, _ = QFileDialog.getSaveFileName(
             self,
-            "Save DOCX grid",
+            "Save image grid",
             str(Path.cwd() / "image_grid.docx"),
             "Word Document (*.docx)",
         )
@@ -258,11 +389,13 @@ class MainWindow(QMainWindow):
             return
 
         try:
-            _build_docx_grid(self._queue, Path(save_path))
+            build_docx(entries, Path(save_path))
+            total_slots = sum(e.quantity for e in entries)
             QMessageBox.information(
                 self,
-                "Done",
-                f"Saved {len(self._queue)} image(s) to:\n{save_path}",
+                "Saved",
+                f"Exported {total_slots} image slot(s) across "
+                f"{len(entries)} queue item(s).\n\n{save_path}",
             )
         except Exception as exc:
             QMessageBox.critical(self, "Export failed", str(exc))
@@ -271,88 +404,45 @@ class MainWindow(QMainWindow):
     # Helpers
     # ------------------------------------------------------------------
 
-    def _refresh_status(self):
-        folder_str = str(self._current_folder) if self._current_folder else "none"
+    def _queue_paths(self) -> set[Path]:
+        paths: set[Path] = set()
+        for row in range(self.queue_table.rowCount()):
+            item = self.queue_table.item(row, 3)
+            if item:
+                paths.add(Path(item.text()))
+        return paths
+
+    def _collect_entries(self) -> list[QueueEntry]:
+        entries: list[QueueEntry] = []
+        for row in range(self.queue_table.rowCount()):
+            path_item = self.queue_table.item(row, 3)
+            combo: QComboBox | None = self.queue_table.cellWidget(row, 1)  # type: ignore[assignment]
+            spin: QSpinBox | None = self.queue_table.cellWidget(row, 2)    # type: ignore[assignment]
+            if path_item and combo and spin:
+                entries.append(
+                    QueueEntry(
+                        path=Path(path_item.text()),
+                        product_type=combo.currentText(),
+                        quantity=spin.value(),
+                    )
+                )
+        return entries
+
+    def _refresh_status(self) -> None:
+        folder = str(self._current_folder) if self._current_folder else "none"
         self.status.showMessage(
-            f"{self.table.rowCount()} image(s) found  |  folder: {folder_str}"
+            f"{self.table.rowCount()} image(s) found  |  folder: {folder}"
         )
 
-    def _refresh_queue_ui(self):
-        count = len(self._queue)
+    def _refresh_queue_ui(self) -> None:
+        count = self.queue_table.rowCount()
         self.queue_count_label.setText(f"{count} image(s)")
         self.print_btn.setEnabled(count > 0)
 
 
-# ------------------------------------------------------------------
-# DOCX export
-# ------------------------------------------------------------------
-
-def _build_docx_grid(paths: list[Path], dest: Path) -> None:
-    doc = Document()
-
-    # Narrow margins to maximise usable page width
-    for section in doc.sections:
-        section.top_margin = Inches(0.5)
-        section.bottom_margin = Inches(0.5)
-        section.left_margin = Inches(0.6)
-        section.right_margin = Inches(0.6)
-
-    heading = doc.add_paragraph("Image Grid")
-    heading.style = doc.styles["Heading 1"]
-
-    # Build table
-    cols = GRID_COLUMNS
-    rows_needed = (len(paths) + cols - 1) // cols
-    table = doc.add_table(rows=rows_needed, cols=cols)
-    table.style = "Table Grid"
-
-    for col_idx in range(cols):
-        for cell in table.columns[col_idx].cells:
-            cell.width = Inches(COL_WIDTH_IN)
-
-    for i, img_path in enumerate(paths):
-        row_idx = i // cols
-        col_idx = i % cols
-        cell = table.cell(row_idx, col_idx)
-        cell.width = Inches(COL_WIDTH_IN)
-
-        para = cell.paragraphs[0]
-        para.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        run = para.add_run()
-
-        img_bytes = _resize_image(img_path, THUMB_PX)
-        run.add_picture(img_bytes, width=Inches(COL_WIDTH_IN - 0.1))
-
-        # Filename caption below the image
-        cap_para = cell.add_paragraph(img_path.name)
-        cap_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        cap_para.runs[0].font.size = Pt(7)
-
-    # Clear leftover empty cells in the last row
-    total_slots = rows_needed * cols
-    for empty_slot in range(len(paths), total_slots):
-        row_idx = empty_slot // cols
-        col_idx = empty_slot % cols
-        cell = table.cell(row_idx, col_idx)
-        cell.paragraphs[0].clear()
-
-    doc.save(str(dest))
-
-
-def _resize_image(path: Path, max_px: int) -> io.BytesIO:
-    """Open an image, thumbnail it to max_px×max_px, return as JPEG BytesIO."""
-    with PilImage.open(path) as img:
-        img = img.convert("RGB")
-        img.thumbnail((max_px, max_px), PilImage.Resampling.LANCZOS)
-        buf = io.BytesIO()
-        img.save(buf, format="JPEG", quality=85)
-        buf.seek(0)
-        return buf
-
-
-# ------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Misc helpers
-# ------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 
 def _human_size(n: int) -> str:
     for unit in ("B", "KB", "MB", "GB"):
