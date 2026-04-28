@@ -11,7 +11,7 @@ import io
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from PIL import Image as PilImage
+from PIL import Image as PilImage, ImageDraw
 from docx import Document
 from docx.shared import Inches, Pt
 from docx.enum.text import WD_ALIGN_PARAGRAPH
@@ -31,19 +31,19 @@ class ProductSpec:
     width_in: float    # image width in the document (inches)
     height_in: float   # image height in the document (inches)
     cols: int          # grid columns per row
-    landscape: bool = False  # page orientation for this section
+    landscape: bool = False                  # page orientation for this section
+    corner_radius: int = 0                   # rounded-corner radius in pixels (0 = square)
+    circle: bool = False                     # True → radius auto-set to half the shortest side (overrides corner_radius)
+    border_px: int = 0                       # border stroke thickness in pixels (0 = no border)
+    border_color: tuple = (0, 0, 0, 255)     # border color as RGBA
 
 
 SPECS: dict[str, ProductSpec] = {
-    # 4 across × 5 down on a landscape page
-    "Lighter":      ProductSpec(width_in=2.22, height_in=1.42, cols=4, landscape=True),
-    # 3 × 4 on a portrait page
-    "Stash Jar":    ProductSpec(width_in=2.55, height_in=2.55, cols=3, landscape=False),
-    # 3 × 4 on a portrait page
-    "Grinder":      ProductSpec(width_in=2.35, height_in=2.35, cols=3, landscape=False),
-    # 2 portrait trays per row
-    "Rolling Tray": ProductSpec(width_in=3.90, height_in=5.70, cols=2, landscape=False),
-    "Other":        ProductSpec(width_in=2.00, height_in=2.00, cols=3, landscape=False),
+    "Lighter":      ProductSpec(width_in=1.42, height_in=2.22, cols=5, corner_radius=15),
+    "Stash Jar":    ProductSpec(width_in=2.55, height_in=2.55, cols=3, circle=True),
+    "Grinder":      ProductSpec(width_in=2.35, height_in=2.35, cols=3),
+    "Rolling Tray": ProductSpec(width_in=3.90, height_in=5.70, cols=2),
+    "Other":        ProductSpec(width_in=2.00, height_in=2.00, cols=3),
 }
 
 PAGE_W = 8.5    # portrait page width  (inches)
@@ -147,7 +147,7 @@ def _add_image_grid(
         run = para.add_run()
 
         try:
-            buf = _prepare_image(img_path, actual_w, spec.height_in)
+            buf = _prepare_image(img_path, actual_w, spec.height_in, spec=spec)
             run.add_picture(buf, width=Inches(actual_w), height=Inches(spec.height_in))
         except Exception as exc:
             run.text = f"[Error: {img_path.name}]"
@@ -164,18 +164,82 @@ def _add_image_grid(
             para.clear()
 
 
-def _prepare_image(path: Path, width_in: float, height_in: float, dpi: int = 150) -> io.BytesIO:
+def _apply_rounded_corners(img: PilImage.Image, radius: int = 20) -> PilImage.Image:
+    """
+    Punch rounded corners into *img* by applying an alpha mask.
+    Pixels outside the rounded rectangle become fully transparent.
+    *radius* is in pixels relative to the resized image dimensions.
+    """
+    img = img.convert("RGBA")
+    mask = PilImage.new("L", img.size, 0)
+    ImageDraw.Draw(mask).rounded_rectangle([(0, 0), img.size], radius=radius, fill=255)
+    img.putalpha(mask)
+    return img
+
+
+def _apply_border(
+    img: PilImage.Image,
+    border_px: int = 6,
+    radius: int = 20,
+    color: tuple = (0, 0, 0, 255),
+) -> PilImage.Image:
+    """
+    Draw a rounded-rectangle stroke over *img*.
+    *border_px* controls line thickness; *radius* should match _apply_rounded_corners.
+    *color* is an RGBA tuple.
+    """
+    img = img.convert("RGBA")
+    w, h = img.size
+    half = border_px // 2
+    ImageDraw.Draw(img).rounded_rectangle(
+        [(half, half), (w - half, h - half)],
+        radius=radius,
+        outline=color,
+        width=border_px,
+    )
+    return img
+
+
+def _prepare_image(
+    path: Path,
+    width_in: float,
+    height_in: float,
+    dpi: int = 150,
+    spec: ProductSpec | None = None,
+) -> io.BytesIO:
     """
     Resize *path* to the exact target dimensions and return as a PNG BytesIO.
     Images are converted to RGBA (PNG) to preserve transparency where present.
     Aspect-ratio distortion is intentional here; Pillow correction comes later.
+    Image manipulation (corners, border) is driven by the ProductSpec fields.
     """
     target_w = max(1, int(width_in * dpi))
     target_h = max(1, int(height_in * dpi))
 
+    border_px    = spec.border_px    if spec else 6
+    border_color = spec.border_color if spec else (0, 0, 0, 255)
+
+    # circle=True auto-computes the radius so the square image becomes a circle,
+    # regardless of the exact pixel dimensions after _fit_width scaling
+    if spec and spec.circle:
+        corner_radius = min(target_w, target_h) // 2
+    else:
+        corner_radius = spec.corner_radius if spec else 0
+
     with PilImage.open(path) as img:
         img = img.convert("RGBA")
+        src_w, src_h = img.size
+        # Align orientation: always map the longer source side to the longer target side
+        if (src_w > src_h) != (target_w > target_h):
+            target_w, target_h = target_h, target_w
         img = img.resize((target_w, target_h), PilImage.Resampling.LANCZOS)
+        # Skip masking if the image already has meaningful transparency (e.g. pre-circled PNG)
+        # so we don't overwrite soft anti-aliased edges with a hard binary mask
+        already_transparent = img.split()[3].getextrema()[0] < 255
+        if corner_radius > 0 and not already_transparent:
+            img = _apply_rounded_corners(img, radius=corner_radius)
+        if border_px > 0:
+            img = _apply_border(img, border_px=border_px, radius=corner_radius, color=border_color)
         buf = io.BytesIO()
         img.save(buf, format="PNG")
         buf.seek(0)
