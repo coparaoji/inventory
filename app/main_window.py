@@ -111,11 +111,18 @@ class MainWindow(QMainWindow):
         self.search_input = QLineEdit()
         self.search_input.setPlaceholderText("Filter by filename…")
         self.search_input.textChanged.connect(self._on_search)
+
+        self.bulk_type_combo = QComboBox()
+        self.bulk_type_combo.addItems(PRODUCT_TYPES)
+        self.bulk_type_combo.setToolTip("Product type applied when adding images to queue")
+
         add_btn = QPushButton("Add Selected to Queue →")
         add_btn.setToolTip("Add highlighted rows to the print queue (multi-select with Ctrl / Shift)")
         add_btn.clicked.connect(self._on_add_to_queue)
         search_row.addWidget(QLabel("Search:"))
         search_row.addWidget(self.search_input, stretch=1)
+        search_row.addWidget(QLabel("Type:"))
+        search_row.addWidget(self.bulk_type_combo)
         search_row.addWidget(add_btn)
         b_layout.addLayout(search_row)
 
@@ -338,9 +345,10 @@ class MainWindow(QMainWindow):
             fname.setToolTip(str(path))
             self.queue_table.setItem(row, 0, fname)
 
-            # Product type combobox
+            # Product type combobox — initialised to the bulk selector choice
             combo = QComboBox()
             combo.addItems(PRODUCT_TYPES)
+            combo.setCurrentText(self.bulk_type_combo.currentText())
             self.queue_table.setCellWidget(row, 1, combo)
 
             # Quantity spinbox
