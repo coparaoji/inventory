@@ -7,27 +7,10 @@ set "PYTHON=%VENV_DIR%\Scripts\python.exe"
 set "PIP=%VENV_DIR%\Scripts\pip.exe"
 
 :: -----------------------------------------------------------------------
-:: UPDATE  (git-based for now — replace this block when moving off Git)
-:: -----------------------------------------------------------------------
-echo [launcher] Checking for updates...
-cd /d "%APP_DIR%"
-
-where git >nul 2>&1
-if !errorlevel! neq 0 (
-    echo [launcher] git not found - skipping update step.
-    goto :setup_venv
-)
-
-git reset --hard
-git pull
-
-:: -----------------------------------------------------------------------
 :: VENV SETUP
 :: -----------------------------------------------------------------------
-:setup_venv
 if exist "%PYTHON%" goto :install_deps
 
-:: Find a usable Python: try Windows Launcher (py) first, then python
 set "SYSTEM_PYTHON="
 where py >nul 2>&1
 if !errorlevel! equ 0 set "SYSTEM_PYTHON=py"
@@ -54,13 +37,20 @@ if !errorlevel! neq 0 (
 )
 
 :: -----------------------------------------------------------------------
-:: DEPENDENCIES
+:: DEPENDENCIES  (installs PyQt6 + the editable docparser library)
 :: -----------------------------------------------------------------------
 :install_deps
 echo [launcher] Installing / verifying dependencies...
 "%PIP%" install -q -r "%APP_DIR%requirements.txt"
 if !errorlevel! neq 0 (
     echo [launcher] ERROR: pip install failed.
+    pause
+    exit /b 1
+)
+echo [launcher] Installing docparser library...
+"%PIP%" install -q -e "%APP_DIR%..\doc-parser"
+if !errorlevel! neq 0 (
+    echo [launcher] ERROR: docparser install failed.
     pause
     exit /b 1
 )

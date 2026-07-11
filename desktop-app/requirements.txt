@@ -1,0 +1,4 @@
+PyQt6>=6.6.0
+# The desktop app also needs the `docparser` library from this repo. Install it
+# editable from the repo root:  pip install -e doc-parser
+# (launcher.bat does this automatically on Windows.)

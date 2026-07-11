@@ -25,7 +25,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QPixmap, QResizeEvent
 
-from app.docx_export import build_docx, QueueEntry, PRODUCT_TYPES
+from docparser import build_docx, QueueEntry, PRODUCT_TYPES
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".tiff", ".tif"}
 
